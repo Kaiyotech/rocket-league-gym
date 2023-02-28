@@ -1,19 +1,21 @@
 """
     The Rocket League gym environment.
 """
-
+from threading import Thread
 from time import sleep
 from typing import List, Union, Tuple, Dict, Any
 
 import numpy as np
 from gym import Env
 
-from rlgym.gamelaunch import launch_rocket_league, run_injector, page_rocket_league, LaunchPreference
 from rlgym.communication import CommunicationHandler, Message
+from rlgym.gamelaunch import launch_rocket_league, run_injector, page_rocket_league, LaunchPreference
+from rlgym.gamelaunch.minimize import toggle_rl_process
 
 
 class Gym(Env):
-    def __init__(self, match, pipe_id=0, launch_preference=LaunchPreference.EPIC, use_injector=False, force_paging=False):
+    def __init__(self, match, pipe_id=0, launch_preference=LaunchPreference.EPIC, use_injector=False,
+                 force_paging=False, raise_on_crash=False, auto_minimize=False):
         super().__init__()
 
         self._match = match
@@ -23,6 +25,8 @@ class Gym(Env):
         self._launch_preference = launch_preference
         self._use_injector = use_injector
         self._force_paging = force_paging
+
+        self._raise_on_crash = raise_on_crash
 
         self._comm_handler = CommunicationHandler()
         self._local_pipe_name = CommunicationHandler.format_pipe_id(pipe_id)
@@ -36,6 +40,10 @@ class Gym(Env):
         if self._force_paging:
             self._page_client()
 
+        self._minimizing_thread = None
+        self._minimized = False
+        self._auto_minimize = auto_minimize
+
         self._prev_state = None
 
     def _open_game(self):
@@ -47,12 +55,9 @@ class Gym(Env):
             sleep(3)
             run_injector()
 
-
     def _setup_plugin_connection(self):
         self._comm_handler.open_pipe(self._local_pipe_name)
         self._comm_handler.send_message(header=Message.RLGYM_CONFIG_MESSAGE_HEADER, body=self._match.get_config())
-        self._comm_handler.send_message(header=Message.RLGYM_RESET_GAME_STATE_MESSAGE_HEADER,
-                                        body=self._match.get_reset_state())
 
     def _page_client(self) -> bool:
         if self._game_process is None:
@@ -61,6 +66,18 @@ class Gym(Env):
         else:
             print("Forcing Rocket League to page unused memory. PID:", self._game_process.pid)
             return page_rocket_league(rl_pid=self._game_process.pid)
+
+    def _minimize_game(self):
+        if not self._minimized:
+            if self._minimizing_thread is None:
+                # Needs to be run in a separate thread because the window can't be minimized while unresponsive,
+                # which calling the toggle_rl_process function directly, or joining too early, will cause
+                self._minimizing_thread = Thread(target=toggle_rl_process, args=(self._game_process.pid,))
+                self._minimizing_thread.start()
+            elif self._minimizing_thread is not None and not self._minimizing_thread.is_alive():
+                self._minimizing_thread.join()
+                self._minimizing_thread = None
+                self._minimized = True
 
     def reset(self, return_info=False) -> Union[List, Tuple]:
         """
@@ -74,7 +91,7 @@ class Gym(Env):
         exception = self._comm_handler.send_message(header=Message.RLGYM_RESET_GAME_STATE_MESSAGE_HEADER,
                                                     body=state_str)
         if exception is not None:
-            self._attempt_recovery()
+            self._handle_exception()
             exception = self._comm_handler.send_message(header=Message.RLGYM_RESET_GAME_STATE_MESSAGE_HEADER,
                                                         body=state_str)
             if exception is not None:
@@ -85,7 +102,10 @@ class Gym(Env):
         state = self._receive_state()
         self._match.episode_reset(state)
         self._prev_state = state
-        
+
+        if self._auto_minimize:
+            self._minimize_game()  # After a successful episode, try to minimize the game
+
         obs = self._match.build_observations(state)
         if return_info:
             info = {
@@ -105,23 +125,26 @@ class Gym(Env):
         :param actions: An object containing actions, in the format specified by the `ActionParser`.
         :return: A tuple containing (obs, rewards, done, info)
         """
-            
+
+        prev_model_actions = actions
         actions = self._match.parse_actions(actions, self._prev_state)
+
         actions_sent = self._send_actions(actions)
 
         received_state = self._receive_state()
 
-        #If, for any reason, the state is not successfully received, we do not want to just crash the API.
-        #This will simply pretend that the state did not change and advance as though nothing went wrong.
+        # If, for any reason, the state is not successfully received, we do not want to just crash the API.
+        # This will simply pretend that the state did not change and advance as though nothing went wrong.
         if received_state is None:
-            print("FAILED TO RECEIEVE STATE! FALLING TO",self._prev_state)
+            print("FAILED TO RECEIEVE STATE! FALLING TO", self._prev_state)
             state = self._prev_state
         else:
             state = received_state
 
-        obs = self._match.build_observations(state)
+        obs = self._match.build_observations(state, prev_model_actions)
         done = self._match.is_done(state) or received_state is None or not actions_sent
-        reward = self._match.get_rewards(state, done)
+        reward = self._match.get_rewards(state, done, prev_model_actions)
+
         self._prev_state = state
 
         info = {
@@ -140,11 +163,22 @@ class Gym(Env):
         if self._game_process is not None:
             self._game_process.terminate()
 
+    def update_settings(self, game_speed=None, gravity=None, boost_consumption=None):
+        """
+        Updates the specified RLGym instance settings
+
+        :param game_speed: The speed the physics will run at, leave it at 100 unless your game can't run at over 240fps
+        :param gravity:
+        :param boost_consumption:
+        """
+        self._match.update_settings(game_speed=game_speed, gravity=gravity, boost_consumption=boost_consumption)
+        self._comm_handler.send_message(header=Message.RLGYM_CONFIG_MESSAGE_HEADER, body=self._match.get_config())
+
     def _receive_state(self):
         # print("Waiting for state...")
         message, exception = self._comm_handler.receive_message(header=Message.RLGYM_STATE_MESSAGE_HEADER)
         if exception is not None:
-            self._attempt_recovery()
+            self._handle_exception()
             return None
 
         if message is None:
@@ -161,14 +195,21 @@ class Gym(Env):
         assert actions.shape[-1] == 8, "Invalid action shape, last dimension must be 8."
 
         actions_formatted = self._match.format_actions(actions)
-        exception = self._comm_handler.send_message(header=Message.RLGYM_AGENT_ACTION_IMMEDIATE_RESPONSE_MESSAGE_HEADER, body=actions_formatted)
+        exception = self._comm_handler.send_message(header=Message.RLGYM_AGENT_ACTION_IMMEDIATE_RESPONSE_MESSAGE_HEADER,
+                                                    body=actions_formatted)
         if exception is not None:
-            self._attempt_recovery()
+            self._handle_exception()
             return False
         return True
 
-    def _attempt_recovery(self):
-        print("!ROCKET LEAGUE HAS CRASHED!\nATTEMPTING RECOVERY")
+    def _handle_exception(self):
+        if self._raise_on_crash:
+            raise EnvironmentError("Rocket League has crashed")  # Add exception message?
+        else:
+            print("!ROCKET LEAGUE HAS CRASHED!\nATTEMPTING RECOVERY")
+            self.attempt_recovery()
+
+    def attempt_recovery(self):
         import os
         import time
         self.close()
@@ -184,3 +225,4 @@ class Gym(Env):
         self._setup_plugin_connection()
         if self._force_paging:
             self._page_client()
+        self._minimized = False

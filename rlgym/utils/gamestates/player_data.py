@@ -17,6 +17,7 @@ class PlayerData(object):
         self.is_demoed: bool = False
         self.on_ground: bool = False
         self.ball_touched: bool = False
+        self.has_jump: bool = False
         self.has_flip: bool = False
         self.boost_amount: float = -1
         self.car_data: PhysicsObject = PhysicsObject()
@@ -32,6 +33,7 @@ class PlayerData(object):
                  "Is Alive: {}\n" \
                  "On Ground: {}\n" \
                  "Ball Touched: {}\n" \
+                 "Has Jump: {}\n" \
                  "Has Flip: {}\n" \
                  "Boost Amount: {}\n" \
                  "Car Data: {}\n" \
@@ -41,9 +43,10 @@ class PlayerData(object):
                     self.match_shots,
                     self.match_demolishes,
                     self.boost_pickups,
-                    self.is_demoed,
+                    not self.is_demoed,
                     self.on_ground,
                     self.ball_touched,
+                    self.has_jump,
                     self.has_flip,
                     self.boost_amount,
                     self.car_data,
