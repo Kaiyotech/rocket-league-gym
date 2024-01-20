@@ -67,7 +67,7 @@ class Match(Environment):
     def build_observations(self, state) -> Union[Any, List]:
         observations = []
 
-        self._obs_builder.pre_step(state)
+        self._obs_builder.pre_step(state, self._prev_actions[0:len(state.players)])
 
         for i in range(len(state.players)):
             player = state.players[i]
